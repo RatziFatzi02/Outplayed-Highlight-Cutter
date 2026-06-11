@@ -1,0 +1,9 @@
+.venv/
+.tools/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+build/
+dist/
+test_exports/

@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: outplayed-highlight-cutter
+Version: 0.1.0
+Summary: Create clips and highlight reels from Outplayed event markers.
+Requires-Python: >=3.13
+Requires-Dist: PySide6==6.11.1
+Requires-Dist: python-snappy<0.8,>=0.7.3
+Requires-Dist: zstandard<0.26,>=0.25
+Provides-Extra: dev
+Requires-Dist: pytest<10,>=9; extra == "dev"

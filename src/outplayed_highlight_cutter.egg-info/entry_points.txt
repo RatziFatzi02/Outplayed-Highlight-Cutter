@@ -1,0 +1,2 @@
+[console_scripts]
+outplayed-highlight-cutter = outplayed_highlight_cutter.app:main
