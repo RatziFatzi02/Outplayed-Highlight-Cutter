@@ -2,6 +2,8 @@
 
 Windows desktop app that reads Outplayed's local IndexedDB markers and creates individual clips or a combined highlight video.
 
+See [NOTICE.md](NOTICE.md) for the independence, trademark, AI-assistance, and no-warranty notice.
+
 ## Setup
 
 ```powershell
