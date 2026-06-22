@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -63,6 +64,25 @@ def _js_values(value: Any) -> list[Any]:
     return values if isinstance(values, list) else []
 
 
+def _recording_time(*containers: dict[str, Any]) -> datetime | None:
+    keys = ("recordingStartTime", "recordingTime", "creationTime", "createdAt", "startTimestamp")
+    for container in containers:
+        for key in keys:
+            value = container.get(key)
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+                except ValueError:
+                    continue
+            if isinstance(value, (int, float)):
+                timestamp = float(value)
+                if timestamp > 10_000_000_000:
+                    timestamp /= 1000.0
+                if timestamp > 1_000_000_000:
+                    return datetime.fromtimestamp(timestamp, timezone.utc).astimezone()
+    return None
+
+
 def _iter_media_records(records: Iterable[Any]) -> Iterable[MediaRecord]:
     for record in records:
         value_wrapper = getattr(record, "value", None)
@@ -104,6 +124,7 @@ def _iter_media_records(records: Iterable[Any]) -> Iterable[MediaRecord]:
                 session_id=str(payload.get("sessionId")) if payload.get("sessionId") else None,
                 game_id=int(payload["gameId"]) if payload.get("gameId") is not None else None,
                 sequence_number=int(getattr(record, "sequence_number", 0) or 0),
+                recording_time=_recording_time(media, payload),
             )
 
 

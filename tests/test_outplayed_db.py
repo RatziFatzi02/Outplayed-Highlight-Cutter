@@ -17,6 +17,7 @@ def test_extracts_media_and_events() -> None:
     payload = {
         "sessionId": "session",
         "gameId": 123,
+        "createdAt": 1_735_732_800_000,
         "medias": JSArray(
             [
                 {
@@ -39,6 +40,8 @@ def test_extracts_media_and_events() -> None:
     assert media.duration_ms == 30_000
     assert media.events[0].local_time_ms == 5_000
     assert len(media.events) == 1
+    assert media.recording_time is not None
+    assert media.recording_time.year == 2025
 
 
 def test_snapshot_excludes_lock_file(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ class MediaRecord:
     session_id: str | None = None
     game_id: int | None = None
     sequence_number: int = 0
+    recording_time: datetime | None = None
 
 
 @dataclass
@@ -105,4 +107,3 @@ def build_cut_ranges(
         else:
             merged.append(current)
     return merged
-

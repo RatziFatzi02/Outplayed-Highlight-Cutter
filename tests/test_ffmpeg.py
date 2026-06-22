@@ -119,3 +119,18 @@ def test_amd_av1_and_hevc_encoder_arguments() -> None:
     assert hevc[:2] == ["-c:v", "hevc_amf"]
     assert "cqp" in hevc
     assert FfmpegRunner._container_args("hevc_amf") == ["-tag:v", "hvc1"]
+
+
+def test_long_filter_graph_is_written_to_script_file() -> None:
+    graph = ";".join(f"[v{i}][v{i + 1}]xfade=transition=fade:duration=0.250:offset={i}[vx{i}]" for i in range(250))
+    command = ["ffmpeg.exe", "-i", "source.mp4", "-filter_complex", graph, "-map", "[vx249]", "out.mp4"]
+    prepared, cleanup = FfmpegRunner._prepare_command(command)
+    try:
+        assert "-filter_complex" not in prepared
+        assert "-filter_complex_script" in prepared
+        script_path = cleanup[0]
+        assert script_path.read_text(encoding="utf-8") == graph
+        assert len(" ".join(prepared)) < len(" ".join(command))
+    finally:
+        for path in cleanup:
+            path.unlink(missing_ok=True)

@@ -4,14 +4,32 @@ import os
 import re
 import subprocess
 import threading
+import time
+import logging
+import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
 from .models import CutRange, Event
+from .naming import FilenameContext, FilenameTemplates, render_filename, unique_output_path
 
 
-ProgressCallback = Callable[[float, str], None]
+@dataclass(frozen=True)
+class ProgressUpdate:
+    ratio: float
+    encoded_seconds: float
+    expected_seconds: float
+    elapsed_seconds: float
+    speed: float
+    eta_seconds: float | None
+    finishes_at: datetime | None
+    message: str = ""
+
+
+ProgressCallback = Callable[[ProgressUpdate], None]
+LOGGER = logging.getLogger("outplayed_highlight_cutter.ffmpeg")
 
 EVENT_COLORS = {
     "kill": "ef5350",
@@ -55,6 +73,8 @@ class ExportSource:
     source: Path
     cuts: list[CutRange]
     media: MediaInfo
+    game: str = "unknown-game"
+    recording_time: datetime | None = None
 
 
 def default_ffmpeg_path() -> Path:
@@ -398,40 +418,98 @@ class FfmpegRunner:
             [ExportSource(source, cuts, media)], output, encoder, transition, transition_seconds, options
         )
 
+    @staticmethod
+    def _prepare_command(command: list[str]) -> tuple[list[str], list[Path]]:
+        """Move very large filter graphs out of the Windows command line."""
+        try:
+            index = command.index("-filter_complex")
+        except ValueError:
+            return command, []
+        if index + 1 >= len(command):
+            return command, []
+        graph = command[index + 1]
+        command_line = subprocess.list2cmdline(command)
+        if len(graph) < 8_000 and len(command_line) < 24_000:
+            return command, []
+
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".ffmpeg-filter",
+            prefix="outplayed-filter-",
+            delete=False,
+        )
+        with handle:
+            handle.write(graph)
+        script_path = Path(handle.name)
+        prepared = command[:index] + ["-filter_complex_script", str(script_path)] + command[index + 2 :]
+        LOGGER.info(
+            "Using FFmpeg filter_complex_script to avoid long command line: graph=%d chars, command=%d chars",
+            len(graph),
+            len(command_line),
+        )
+        return prepared, [script_path]
+
     def _run(self, command: list[str], expected_seconds: float, callback: ProgressCallback | None) -> None:
         self._cancelled.clear()
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self._process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=flags,
-        )
-        log_lines: list[str] = []
-        assert self._process.stdout is not None
-        for line in self._process.stdout:
-            clean = line.strip()
-            log_lines.append(clean)
-            if len(log_lines) > 200:
-                log_lines.pop(0)
-            if clean.startswith("out_time_ms="):
-                raw_time = clean.split("=", 1)[1]
-                if raw_time != "N/A":
-                    current = float(raw_time) / 1_000_000.0
-                    if callback:
-                        callback(min(1.0, current / max(expected_seconds, 0.001)), clean)
+        started = time.monotonic()
+        prepared_command, cleanup_paths = self._prepare_command(command)
+        LOGGER.info("FFmpeg command: %s", subprocess.list2cmdline(prepared_command))
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self._process = subprocess.Popen(
+                prepared_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=flags,
+            )
+            log_lines: list[str] = []
+            assert self._process.stdout is not None
+            for line in self._process.stdout:
+                clean = line.strip()
+                log_lines.append(clean)
+                if len(log_lines) > 200:
+                    log_lines.pop(0)
+                if clean.startswith("out_time_ms="):
+                    raw_time = clean.split("=", 1)[1]
+                    if raw_time != "N/A":
+                        current = float(raw_time) / 1_000_000.0
+                        if callback:
+                            elapsed = max(0.001, time.monotonic() - started)
+                            speed = max(0.0, current / elapsed)
+                            remaining = max(0.0, expected_seconds - current)
+                            callback(
+                                ProgressUpdate(
+                                    ratio=min(1.0, current / max(expected_seconds, 0.001)),
+                                    encoded_seconds=current,
+                                    expected_seconds=expected_seconds,
+                                    elapsed_seconds=elapsed,
+                                    speed=speed,
+                                    eta_seconds=remaining / speed if speed > 0.001 else None,
+                                    finishes_at=(datetime.now() + timedelta(seconds=remaining / speed)) if speed > 0.001 else None,
+                                    message=clean,
+                                )
+                            )
+                if self._cancelled.is_set():
+                    self._process.terminate()
+                    break
+            return_code = self._process.wait()
+            self._process = None
             if self._cancelled.is_set():
-                self._process.terminate()
-                break
-        return_code = self._process.wait()
-        self._process = None
-        if self._cancelled.is_set():
-            raise FfmpegError("Export cancelled.")
-        if return_code != 0:
-            raise FfmpegError("FFmpeg export failed:\n" + "\n".join(log_lines[-40:]))
+                raise FfmpegError("Export cancelled.")
+            if return_code != 0:
+                LOGGER.error("FFmpeg failed with exit code %s: %s", return_code, " | ".join(log_lines[-20:]))
+                raise FfmpegError("FFmpeg export failed:\n" + "\n".join(log_lines[-40:]))
+            LOGGER.info("FFmpeg completed in %.1f seconds", time.monotonic() - started)
+        finally:
+            for path in cleanup_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.warning("Could not remove temporary FFmpeg filter script: %s", path)
 
     def cancel(self) -> None:
         self._cancelled.set()
@@ -447,19 +525,48 @@ class FfmpegRunner:
         encoder: str,
         callback: ProgressCallback | None = None,
         options: RenderOptions | None = None,
+        templates: FilenameTemplates | None = None,
+        game: str = "unknown-game",
+        recording_time: datetime | None = None,
+        exported_at: datetime | None = None,
     ) -> list[Path]:
         options = options or RenderOptions()
+        templates = templates or FilenameTemplates()
+        exported_at = exported_at or datetime.now()
         output_dir.mkdir(parents=True, exist_ok=True)
         outputs: list[Path] = []
+        reserved: set[Path] = set()
         total = sum(cut.duration_seconds for cut in cuts)
         completed = 0.0
         for index, cut in enumerate(cuts, start=1):
             event_names = "-".join(sorted({event.type for event in cut.events})) or "clip"
-            output = output_dir / f"{source.stem}_{index:03d}_{event_names}.mp4"
+            output = unique_output_path(
+                output_dir,
+                render_filename(
+                    templates.individual,
+                    FilenameContext(
+                        source=source.stem, game=game, recording_time=recording_time,
+                        export_time=exported_at, index=index, events=event_names,
+                        mode="individual", codec=encoder,
+                    ),
+                ),
+                reserved,
+            )
 
-            def scaled(progress: float, message: str, base: float = completed, duration: float = cut.duration_seconds) -> None:
+            def scaled(update: ProgressUpdate, base: float = completed, duration: float = cut.duration_seconds) -> None:
                 if callback:
-                    callback((base + progress * duration) / max(total, 0.001), message)
+                    callback(
+                        ProgressUpdate(
+                            ratio=(base + update.ratio * duration) / max(total, 0.001),
+                            encoded_seconds=base + update.encoded_seconds,
+                            expected_seconds=total,
+                            elapsed_seconds=update.elapsed_seconds,
+                            speed=update.speed,
+                            eta_seconds=update.eta_seconds,
+                            finishes_at=update.finishes_at,
+                            message=update.message,
+                        )
+                    )
 
             command = self.build_individual_command(source, cut, output, media, encoder, options)
             self._run(command, cut.duration_seconds, scaled)
@@ -478,9 +585,23 @@ class FfmpegRunner:
         transition_seconds: float,
         callback: ProgressCallback | None = None,
         options: RenderOptions | None = None,
+        template: str | None = None,
+        game: str = "unknown-game",
+        recording_time: datetime | None = None,
+        exported_at: datetime | None = None,
     ) -> list[Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        output = output_dir / f"{source.stem}_highlights.mp4"
+        output = unique_output_path(
+            output_dir,
+            render_filename(
+                template or FilenameTemplates().per_video,
+                FilenameContext(
+                    source=source.stem, game=game, recording_time=recording_time,
+                    export_time=exported_at or datetime.now(), events="highlight",
+                    mode="per-video", codec=encoder,
+                ),
+            ),
+        )
         command, duration = self.build_highlight_command(
             source, cuts, output, media, encoder, transition, transition_seconds, options
         )
@@ -496,9 +617,23 @@ class FfmpegRunner:
         transition_seconds: float,
         callback: ProgressCallback | None = None,
         options: RenderOptions | None = None,
+        template: str | None = None,
+        exported_at: datetime | None = None,
     ) -> list[Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        output = output_dir / "combined_highlights.mp4"
+        first = sources[0] if sources else None
+        output = unique_output_path(
+            output_dir,
+            render_filename(
+                template or FilenameTemplates().combined,
+                FilenameContext(
+                    source="combined", game=first.game if first else "mixed",
+                    recording_time=first.recording_time if first else None,
+                    export_time=exported_at or datetime.now(), events="highlight",
+                    mode="combined", codec=encoder,
+                ),
+            ),
+        )
         command, duration = self.build_multi_highlight_command(
             sources, output, encoder, transition, transition_seconds, options
         )

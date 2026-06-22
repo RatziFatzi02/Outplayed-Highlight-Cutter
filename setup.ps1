@@ -21,5 +21,4 @@ if (-not (Test-Path -LiteralPath $BundledFfmpeg) -and (Test-Path -LiteralPath $E
     Copy-Item -LiteralPath $ExistingFfmpeg -Destination $BundledFfmpeg
 }
 
-Write-Host "Setup complete. Start with .\start.ps1"
-
+Write-Host "Setup complete. Start with .\start.bat"
